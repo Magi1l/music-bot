@@ -1,0 +1,8 @@
+run="npm install && node index.js"
+
+// Replit 설정
+[replit]
+autostart=true
+autostartInterval=86400  # 24시간 (초 단위)
+keepAlive=true
+restartOnExit=false
