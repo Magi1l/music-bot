@@ -6,35 +6,35 @@ const {
 const { DisTube } = require('distube');
 const { SpotifyPlugin } = require('@distube/spotify');
 const { SoundCloudPlugin } = require('@distube/soundcloud');
-// const { YouTubePlugin } = require('@distube/youtube'); // << 유튜브 플러그인 임시 주석 처리
+// const { YouTubePlugin } = require('@distube/youtube'); // 유튜브 플러그인 임시 주석 처리
 const axios = require('axios');
 const cheerio = require('cheerio');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
 const express = require('express');
 
-// MongoDB 연결 (불필요 옵션 제거, 연결 성공/실패 로그 추가)
+// ===== MongoDB 연결 및 모델 =====
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB 연결 성공'))
   .catch(err => console.error('❌ MongoDB 연결 실패:', err));
+
 const userSchema = new mongoose.Schema({
   userId: String,
   xp: { type: Number, default: 0 },
   level: { type: Number, default: 1 },
   points: { type: Number, default: 0 }
 });
-// 인덱스 추가 (성능 최적화)
 userSchema.index({ userId: 1 }, { unique: true });
 userSchema.index({ level: -1 });
 const User = mongoose.model('User', userSchema);
 
-// 공지 채널 설정용 noticeConfig 스키마/모델 추가
 const noticeConfigSchema = new mongoose.Schema({
   guildId: String,
   noticeChannelId: String
 });
 const NoticeConfig = mongoose.model('NoticeConfig', noticeConfigSchema);
 
+// ===== Discord 클라이언트 =====
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -45,10 +45,84 @@ const client = new Client({
   ]
 });
 
-// 크롤링 설정 저장 구조 (최상단에 선언)
-const websiteConfig = new Map(); // guildId → Map(name → config)
+// ===== 명령어 배열 (한 번만 선언) =====
+const commands = [
+  {
+    name: '색상설정',
+    description: 'HEX 코드로 닉네임 색상 변경',
+    options: [{
+      name: 'hex코드',
+      type: 3,
+      description: '#을 제외한 6자리 코드 (예: FF0000)',
+      required: true
+    }]
+  },
+  {
+    name: '운세',
+    description: '오늘의 운세 확인'
+  },
+  {
+    name: '익명',
+    description: '익명 메시지 전송',
+    options: [{
+      name: '메시지',
+      type: 3,
+      description: '전송할 내용',
+      required: true
+    }]
+  },
+  {
+    name: 'play',
+    description: '노래 검색 또는 URL로 재생',
+    options: [
+      { name: 'query', type: 3, description: '검색어/URL', required: true },
+      { 
+        name: 'source', 
+        type: 3, 
+        description: '검색 우선 소스 (youtube/spotify/soundcloud)', 
+        required: false, 
+        choices: [
+          { name: 'YouTube', value: 'youtube' },
+          { name: 'Spotify', value: 'spotify' },
+          { name: 'SoundCloud', value: 'soundcloud' }
+        ]
+      }
+    ]
+  },
+  { name: 'skip', description: '현재 곡을 건너뜁니다.' },
+  { name: 'queue', description: '재생 대기열을 확인합니다.' },
+  { name: 'stop', description: '재생을 중지합니다.' },
+  {
+    name: '크롤링설정',
+    description: '웹사이트 크롤링 설정 (관리자만)',
+    options: [
+      { name: 'name', type: 3, description: '설정 이름', required: true },
+      { name: 'url', type: 3, description: '크롤링할 웹사이트 URL', required: true },
+      { name: '채널', type: 7, description: '알림 채널', required: true },
+      { name: '간격', type: 4, description: '크롤링 간격(분)', required: false, minValue: 1, maxValue: 1440 }
+    ]
+  },
+  { name: '웹사이트조회', description: '현재 웹사이트 크롤링 설정 확인' },
+  {
+    name: '웹사이트삭제',
+    description: '웹사이트 크롤링 설정 삭제',
+    options: [
+      { name: 'name', type: 3, description: '삭제할 설정 이름', required: true }
+    ]
+  },
+  {
+    name: '공지채널설정',
+    description: '공지사항을 보낼 채널을 설정합니다',
+    options: [{
+      name: '채널',
+      type: 7,
+      description: '공지사항을 보낼 텍스트 채널',
+      required: true
+    }]
+  }
+];
 
-// 쿠키 파싱 로직
+// ===== DisTube(음악) 설정 =====
 const cookies = process.env.YOUTUBE_COOKIE?.split(';')
   .map(pair => {
     if (!pair.includes('=')) return null;
@@ -66,13 +140,13 @@ const distube = new DisTube(client, {
       }
     }),
     new SoundCloudPlugin(),
-    // new YouTubePlugin({ cookies }), // << 유튜브 플러그인 임시 주석 처리
+    // new YouTubePlugin({ cookies }),
   ],
   emitNewSongOnly: true,
   nsfw: false,
 });
 
-// 동시 재생 방지 큐 시스템
+// ===== 재생 큐 시스템 =====
 const playQueue = [];
 let isPlaying = false;
 async function processQueue() {
@@ -89,7 +163,6 @@ async function processQueue() {
       interaction.editReply({ content: `❌ 재생 오류: ${error.message}` }).catch(() => {});
       throw error;
     });
-    // 재생 후 큐에 곡이 없으면 안내
     setTimeout(() => {
       const queue = distube.getQueue(interaction.guildId);
       if (!queue || !queue.songs || queue.songs.length === 0) {
@@ -104,106 +177,28 @@ async function processQueue() {
   processQueue();
 }
 
-// 상대경로 처리 함수
-function resolveUrl(link, baseUrl) {
-  try {
-    return new URL(link, baseUrl).href;
-  } catch {
-    return null;
+// ===== 웹사이트 크롤링 설정 구조 =====
+const websiteConfig = new Map(); // guildId → Map(name → config)
+
+// ===== 명령어 등록 (글로벌+길드 모두) =====
+client.once('ready', async () => {
+  // 글로벌 등록
+  await client.application.commands.set(commands);
+  console.log('글로벌 명령어 등록 완료!');
+
+  // 길드(서버) 전용 등록(즉시 반영)
+  const guild = client.guilds.cache.get('652710221759774730');
+  if (guild) {
+    await guild.commands.set(commands);
+    console.log('길드(652710221759774730) 전용 명령어 등록 완료!');
+  } else {
+    console.log('서버(652710221759774730)에 봇이 없습니다.');
   }
-}
-
-// 사이트 구조 유연화 함수
-function extractPost($, el, baseUrl) {
-  const $el = $(el);
-  const title = $el.find('[itemprop="name"], .title, h1, h2').first().text().trim();
-  const rawLink = $el.find('[href], [data-url]').attr('href') || $el.attr('data-url');
-  const link = resolveUrl(rawLink, baseUrl);
-  const image = $el.find('img').attr('src') || $el.find('[itemprop="image"]').attr('content');
-  return { title, link, image };
-}
-
-// ----------- 명령어 등록 -----------
-client.once('ready', () => {
-  client.application.commands.set([
-    {
-      name: '색상설정',
-      description: 'HEX 코드로 닉네임 색상 변경',
-      options: [{
-        name: 'hex코드',
-        type: 3,
-        description: '#을 제외한 6자리 코드 (예: FF0000)',
-        required: true
-      }]
-    },
-    {
-      name: '운세',
-      description: '오늘의 운세 확인'
-    },
-    {
-      name: '익명',
-      description: '익명 메시지 전송',
-      options: [{
-        name: '메시지',
-        type: 3,
-        description: '전송할 내용',
-        required: true
-      }]
-    },
-    {
-      name: 'play',
-      description: '노래 검색 또는 URL로 재생',
-      options: [
-        { name: 'query', type: 3, description: '검색어/URL', required: true },
-        { 
-          name: 'source', 
-          type: 3, 
-          description: '검색 우선 소스 (youtube/spotify/soundcloud)', 
-          required: false, 
-          choices: [
-            { name: 'YouTube', value: 'youtube' },
-            { name: 'Spotify', value: 'spotify' },
-            { name: 'SoundCloud', value: 'soundcloud' }
-          ]
-        }
-      ]
-    },
-    { name: 'skip', description: '현재 곡을 건너뜁니다.' },
-    { name: 'queue', description: '재생 대기열을 확인합니다.' },
-    { name: 'stop', description: '재생을 중지합니다.' },
-    {
-      name: '크롤링설정',
-      description: '웹사이트 크롤링 설정 (관리자만)',
-      options: [
-        { name: 'name', type: 3, description: '설정 이름', required: true },
-        { name: 'url', type: 3, description: '크롤링할 웹사이트 URL', required: true },
-        { name: '채널', type: 7, description: '알림 채널', required: true },
-        { name: '간격', type: 4, description: '크롤링 간격(분)', required: false, minValue: 1, maxValue: 1440 }
-      ]
-    },
-    { name: '웹사이트조회', description: '현재 웹사이트 크롤링 설정 확인' },
-    {
-      name: '웹사이트삭제',
-      description: '웹사이트 크롤링 설정 삭제',
-      options: [
-        { name: 'name', type: 3, description: '삭제할 설정 이름', required: true }
-      ]
-    },
-    {
-      name: '공지채널설정',
-      description: '공지사항을 보낼 채널을 설정합니다',
-      options: [{
-        name: '채널',
-        type: 7, // 채널 타입
-        description: '공지사항을 보낼 텍스트 채널',
-        required: true
-      }]
-    },
-  ]);
   console.log(`${client.user.tag} 온라인!`);
 });
 
-// ----------- 명령어 처리 -----------
+// ===== 명령어 처리 =====
+const fortunes = ['大吉', '中吉', '小吉', '凶'];
 client.on('interactionCreate', async interaction => {
   if (!interaction.isCommand()) return;
   const { commandName, options, guild, member } = interaction;
@@ -263,12 +258,9 @@ client.on('interactionCreate', async interaction => {
     const query = options.getString('query');
     const source = options.getString('source') || 'youtube';
     if (!member.voice.channel) return interaction.reply({ content: '음성 채널에 먼저 들어가세요!', flags: MessageFlags.Ephemeral });
-
-    // 유튜브 링크 또는 source가 youtube일 때 안내
     if (source === 'youtube' || /youtu(be\.com|\.be)\//.test(query)) {
       return interaction.reply({ content: '❌ 유튜브는 현재 재생할 수 없습니다. SoundCloud 또는 Spotify를 이용해 주세요.', flags: MessageFlags.Ephemeral });
     }
-
     try {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       let playQuery = query;
@@ -277,15 +269,6 @@ client.on('interactionCreate', async interaction => {
       } else if (source === 'soundcloud' && !/^https?:\/\//.test(query) && !query.startsWith('scsearch:')) {
         playQuery = `scsearch:"${query}"`;
       }
-      // 디버그: SoundCloud 검색 쿼리 출력
-      // if (source === 'soundcloud') {
-      //   console.log('SoundCloud 검색 시도:', playQuery);
-      //   const results = await distube.search(playQuery, { limit: 1 }).catch(() => []);
-      //   console.log('검색 결과:', results);
-      //   if (!results || results.length === 0) {
-      //     return interaction.editReply({ content: `🔍 SoundCloud에서 "${query}" 검색 결과가 없습니다. 직접 링크를 입력해주세요.` });
-      //   }
-      // }
       playQueue.push({ interaction, query: playQuery, originalQuery: query, source });
       await processQueue();
       if (!/^https?:\/\//.test(query)) {
@@ -331,14 +314,12 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  // 1. 닉네임 색상 시스템
+  // --- 닉네임 색상 시스템 ---
   if (commandName === '색상설정') {
     const color = options.getString('hex코드').replace('#', '');
     if (!/^[0-9A-Fa-f]{6}$/i.test(color)) return interaction.reply({ content: '❌ 올바른 HEX 코드를 입력해주세요!', ephemeral: true });
-    
     const roleName = `COLOR-${color}`;
     let role = guild.roles.cache.find(r => r.name === roleName);
-    
     if (!role) {
       role = await guild.roles.create({
         name: roleName,
@@ -346,19 +327,18 @@ client.on('interactionCreate', async interaction => {
         permissions: []
       });
     }
-    
     await member.roles.add(role);
     interaction.reply({ content: `✅ #${color} 색상이 적용되었습니다!`, ephemeral: true });
   }
 
-  // 2. 레벨 시스템
+  // --- 오늘의 운세 ---
   if (commandName === '운세') {
     const dateSeed = new Date().toISOString().split('T')[0] + interaction.user.id;
     const hash = dateSeed.split('').reduce((a,c) => a + c.charCodeAt(0), 0);
     interaction.reply(`🔮 오늘의 운세: ${fortunes[hash % 4]}`);
   }
 
-  // 3. 웹훅 연동 시스템
+  // --- 익명 메시지 ---
   if (commandName === '익명') {
     const msg = options.getString('메시지');
     interaction.channel.send({
@@ -371,7 +351,7 @@ client.on('interactionCreate', async interaction => {
     interaction.reply({ content: '✅ 메시지 전송 완료', ephemeral: true });
   }
 
-  // /공지채널설정 명령어 처리
+  // --- 공지채널설정 ---
   if (commandName === '공지채널설정') {
     const channel = options.getChannel('채널');
     if (!channel || !channel.isTextBased()) {
@@ -386,11 +366,26 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// ----------- 음악 컨트롤 버튼 및 임베드 -----------
+// ===== 레벨/포인트 시스템 =====
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  const user = await User.findOneAndUpdate(
+    { userId: message.author.id },
+    { $inc: { xp: 5 + Math.floor(Math.random() * 10) } },
+    { upsert: true, new: true }
+  );
+  const newLevel = Math.floor(0.1 * Math.sqrt(user.xp));
+  if (newLevel > user.level) {
+    user.level = newLevel;
+    await user.save();
+    message.channel.send(`🎉 ${message.author} 레벨 업! (Lv. ${newLevel})`);
+  }
+});
+
+// ===== 음악 컨트롤 버튼 및 임베드 =====
 distube.on('playSong', async (queue, song) => {
   try {
     if (!song || !queue || !queue.textChannel) return;
-    // 채널 안전 fetch
     let channel = queue.textChannel;
     if (!channel?.isTextBased) {
       channel = await client.channels.fetch(queue.textChannel.id).catch(() => null);
@@ -421,7 +416,7 @@ distube.on('playSong', async (queue, song) => {
   }
 });
 
-// ----------- 컨트롤 버튼 처리 -----------
+// ===== 음악 컨트롤 버튼 처리 =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const queue = distube.getQueue(interaction.guildId);
@@ -451,7 +446,7 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// ----------- 웹크롤링 스케줄러 -----------
+// ===== 웹크롤링 스케줄러 =====
 function setupCron(guildId, name, config) {
   if (config.cron) config.cron.stop();
   if (config.url && config.channelId) {
@@ -459,7 +454,22 @@ function setupCron(guildId, name, config) {
   }
 }
 
-// ----------- 웹크롤링 함수 -----------
+// ===== 웹크롤링 함수 =====
+function resolveUrl(link, baseUrl) {
+  try {
+    return new URL(link, baseUrl).href;
+  } catch {
+    return null;
+  }
+}
+function extractPost($, el, baseUrl) {
+  const $el = $(el);
+  const title = $el.find('[itemprop="name"], .title, h1, h2').first().text().trim();
+  const rawLink = $el.find('[href], [data-url]').attr('href') || $el.attr('data-url');
+  const link = resolveUrl(rawLink, baseUrl);
+  const image = $el.find('img').attr('src') || $el.find('[itemprop="image"]').attr('content');
+  return { title, link, image };
+}
 async function checkWebsite(guildId, name) {
   const guildConfigs = websiteConfig.get(guildId);
   if (!guildConfigs) return;
@@ -474,22 +484,17 @@ async function checkWebsite(guildId, name) {
       try {
         const post = extractPost($, el, config.url);
         if (post.title && post.link) posts.push(post);
-      } catch (e) {
-        // 개별 포스트 추출 실패는 무시
-      }
+      } catch (e) {}
     }
     if (posts.length > 0 && posts[0].title !== config.lastPostId) {
       config.lastPostId = posts[0].title;
-      // 채널 안전 fetch
       const channel = await client.channels.fetch(config.channelId).catch(() => null);
       if (!channel?.isTextBased()) return;
       const embed = new EmbedBuilder()
         .setTitle(posts[0].title)
         .setURL(posts[0].link)
         .setImage(posts[0].image)
-        .addFields(
-          { name: '바로가기', value: `[클릭](${posts[0].link})`, inline: true }
-        )
+        .addFields({ name: '바로가기', value: `[클릭](${posts[0].link})`, inline: true })
         .setColor('#2b2d31');
       await channel.send({ embeds: [embed] });
     }
@@ -498,7 +503,7 @@ async function checkWebsite(guildId, name) {
   }
 }
 
-// ----------- 에러 핸들링 -----------
+// ===== 에러 핸들링 =====
 distube.on('error', async (channel, error) => {
   try {
     if (error.message && error.message.includes('NO_RESULT')) {
@@ -529,7 +534,7 @@ distube.on('error', async (channel, error) => {
   }
 });
 
-// 6. 대시보드 API (서버 랭킹)
+// ===== 대시보드 API (서버 랭킹) =====
 const dashboardApp = express();
 dashboardApp.get('/api/users', async (req, res) => {
   const users = await User.find().sort({ level: -1, xp: -1 }).limit(10);
@@ -537,8 +542,9 @@ dashboardApp.get('/api/users', async (req, res) => {
 });
 dashboardApp.listen(3001);
 
-// 웹훅 연동 시스템에서 공지 채널을 DB에서 조회
+// ===== 웹훅 연동 시스템 (공지) =====
 const webhookApp = express();
+webhookApp.use(express.json());
 webhookApp.post('/webhook', async (req, res) => {
   const guildId = req.body.guildId;
   const config = await NoticeConfig.findOne({ guildId });
@@ -556,6 +562,7 @@ webhookApp.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
+// ===== 예외 핸들링 =====
 process.on('uncaughtException', error => {
   console.error('처리되지 않은 예외:', error);
 });
