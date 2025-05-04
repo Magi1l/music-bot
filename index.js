@@ -13,11 +13,10 @@ const cron = require('node-cron');
 const mongoose = require('mongoose');
 const express = require('express');
 
-// MongoDB 연결 (옵션 추가)
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-});
+// MongoDB 연결 (불필요 옵션 제거, 연결 성공/실패 로그 추가)
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ MongoDB 연결 성공'))
+  .catch(err => console.error('❌ MongoDB 연결 실패:', err));
 const userSchema = new mongoose.Schema({
   userId: String,
   xp: { type: Number, default: 0 },
@@ -39,7 +38,6 @@ const NoticeConfig = mongoose.model('NoticeConfig', noticeConfigSchema);
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers
