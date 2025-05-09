@@ -10,13 +10,18 @@
     "@distube/spotify": "^2.0.2",
     "@distube/youtube": "^1.0.4",
     "axios": "^1.9.0",
+    "axios-retry": "^4.5.0",
     "cheerio": "^1.0.0",
+    "crypto": "^1.0.1",
     "discord.js": "^14.19.3",
     "distube": "^5.0.7",
     "dotenv": "^16.5.0",
     "ffmpeg-static": "^5.1.0",
     "html-parse-stringify2": "^2.0.1",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "puppeteer": "^24.8.2",
+    "url-join": "^5.0.0",
+    "winston": "^3.17.0"
   },
   "scripts": {
     "start": "node index.js"

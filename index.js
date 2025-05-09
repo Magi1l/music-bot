@@ -12,6 +12,16 @@ const cheerio = require('cheerio');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
 const express = require('express');
+const ShopItem = require('./models/ShopItem');
+const PurchaseHistory = require('./models/PurchaseHistory');
+const User = require('./models/User');
+const GuildConfig = require('./models/GuildConfig');
+const CrawlConfig = require('./models/CrawlConfig');
+const puppeteer = require('puppeteer');
+const axiosRetry = require('axios-retry');
+const urlJoin = require('url-join');
+const winston = require('winston');
+const crypto = require('crypto');
 
 // ===== MongoDB 연결 및 모델 =====
 mongoose.connect(process.env.MONGODB_URI)
@@ -45,82 +55,85 @@ const client = new Client({
   ]
 });
 
-// ===== 명령어 배열 (한 번만 선언) =====
-const commands = [
-  {
-    name: '색상설정',
-    description: 'HEX 코드로 닉네임 색상 변경',
-    options: [{
-      name: 'hex코드',
-      type: 3,
-      description: '#을 제외한 6자리 코드 (예: FF0000)',
-      required: true
-    }]
-  },
-  {
-    name: '운세',
-    description: '오늘의 운세 확인'
-  },
-  {
-    name: '익명',
-    description: '익명 메시지 전송',
-    options: [{
-      name: '메시지',
-      type: 3,
-      description: '전송할 내용',
-      required: true
-    }]
-  },
-  {
-    name: 'play',
-    description: '노래 검색 또는 URL로 재생',
-    options: [
-      { name: 'query', type: 3, description: '검색어/URL', required: true },
-      { 
-        name: 'source', 
-        type: 3, 
-        description: '검색 우선 소스 (youtube/spotify/soundcloud)', 
-        required: false, 
-        choices: [
-          { name: 'YouTube', value: 'youtube' },
-          { name: 'Spotify', value: 'spotify' },
-          { name: 'SoundCloud', value: 'soundcloud' }
-        ]
-      }
-    ]
-  },
-  { name: 'skip', description: '현재 곡을 건너뜁니다.' },
-  { name: 'queue', description: '재생 대기열을 확인합니다.' },
-  { name: 'stop', description: '재생을 중지합니다.' },
-  {
-    name: '크롤링설정',
-    description: '웹사이트 크롤링 설정 (관리자만)',
-    options: [
-      { name: 'name', type: 3, description: '설정 이름', required: true },
-      { name: 'url', type: 3, description: '크롤링할 웹사이트 URL', required: true },
-      { name: '채널', type: 7, description: '알림 채널', required: true },
-      { name: '간격', type: 4, description: '크롤링 간격(분)', required: false, minValue: 1, maxValue: 1440 }
-    ]
-  },
-  { name: '웹사이트조회', description: '현재 웹사이트 크롤링 설정 확인' },
-  {
-    name: '웹사이트삭제',
-    description: '웹사이트 크롤링 설정 삭제',
-    options: [
-      { name: 'name', type: 3, description: '삭제할 설정 이름', required: true }
-    ]
-  },
-  {
-    name: '공지채널설정',
-    description: '공지사항을 보낼 채널을 설정합니다',
-    options: [{
-      name: '채널',
-      type: 7,
-      description: '공지사항을 보낼 텍스트 채널',
-      required: true
-    }]
-  }
+// ===== 명령어 파일 불러오기 및 등록 =====
+const adminCommands = require('./commands/admin/addShopItem');
+const userCommands = [
+  require('./commands/user/ranking'),
+  require('./commands/user/previewProfile')
 ];
+
+client.once('ready', async () => {
+  await client.application.commands.set([adminCommands.data, ...userCommands.map(cmd => cmd.data)]);
+  console.log('명령어 등록 완료!');
+  console.log(`${client.user.tag} 온라인!`);
+});
+
+// ===== 명령어 처리 =====
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  const command = interaction.commandName;
+  const userCommand = userCommands.find(cmd => cmd.data.name === command);
+  const adminCommand = adminCommands.data.name === command;
+  if (adminCommand) {
+    await adminCommands.execute(interaction);
+  } else if (userCommand) {
+    await userCommand.execute(interaction);
+  }
+});
+
+// ===== 음성 경험치 적립 로직 =====
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  // 봇이거나 음성 채널 입장/퇴장 아닌 경우 무시
+  if (!newState.member || newState.member.user.bot) return;
+  const userId = newState.member.id;
+  const guildId = newState.guild.id;
+  // 음성 채널에 새로 들어온 경우만 처리
+  if (!oldState.channelId && newState.channelId) {
+    // 1분마다 경험치 지급 (간단 구현: 1분 후 1회 지급)
+    setTimeout(async () => {
+      const config = await GuildConfig.findOne({ guildId });
+      const voiceXp = config?.xpConfig?.voiceXpPerMinute ?? 5;
+      await User.findOneAndUpdate(
+        { userId },
+        { $inc: { xp: voiceXp } },
+        { upsert: true, new: true }
+      );
+    }, 60 * 1000);
+  }
+});
+
+// ===== 채팅 경험치 적립 로직 개선 =====
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  const guildId = message.guildId;
+  const userId = message.author.id;
+  const config = await GuildConfig.findOne({ guildId });
+  const textXp = config?.xpConfig?.textXpPerMessage ?? 10;
+  const cooldown = config?.xpConfig?.textCooldown ?? 60;
+  const multipliers = config?.xpConfig?.textChannelMultipliers || [];
+  // 쿨타임 체크용 캐시 (메모리)
+  if (!global.textXpCooldown) global.textXpCooldown = {};
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+  if (global.textXpCooldown[key] && now - global.textXpCooldown[key] < cooldown * 1000) return;
+  global.textXpCooldown[key] = now;
+  // 채널별 배수 적용
+  let multiplier = 1;
+  const found = multipliers.find(m => m.channelId === message.channel.id);
+  if (found) multiplier = found.multiplier;
+  const addXp = Math.round(textXp * multiplier);
+  const user = await User.findOneAndUpdate(
+    { userId },
+    { $inc: { xp: addXp } },
+    { upsert: true, new: true }
+  );
+  const newLevel = Math.floor(0.1 * Math.sqrt(user.xp));
+  if (newLevel > user.level) {
+    user.level = newLevel;
+    await user.save();
+    message.channel.send(`🎉 ${message.author} 레벨 업! (Lv. ${newLevel})`);
+  }
+});
 
 // ===== DisTube(음악) 설정 =====
 const cookies = process.env.YOUTUBE_COOKIE?.split(';')
@@ -197,191 +210,6 @@ client.once('ready', async () => {
   console.log(`${client.user.tag} 온라인!`);
 });
 
-// ===== 명령어 처리 =====
-const fortunes = ['大吉', '中吉', '小吉', '凶'];
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
-  const { commandName, options, guild, member } = interaction;
-
-  // --- 웹사이트 크롤링 명령어 ---
-  if (commandName === '크롤링설정') {
-    if (!member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '관리자만 사용할 수 있습니다.', flags: MessageFlags.Ephemeral });
-    }
-    const name = options.getString('name');
-    const url = options.getString('url');
-    const channel = options.getChannel('채널');
-    const interval = (options.getInteger('간격') || 5) * 60000;
-    if (!channel.isTextBased()) {
-      return interaction.reply({ content: '채널은 텍스트 채널이어야 합니다.', flags: MessageFlags.Ephemeral });
-    }
-    let guildConfigs = websiteConfig.get(guild.id);
-    if (!guildConfigs) guildConfigs = new Map();
-    if (guildConfigs.has(name)) {
-      return interaction.reply({ content: '이미 등록된 이름입니다.', flags: MessageFlags.Ephemeral });
-    }
-    const config = { url, channelId: channel.id, interval, lastPostId: null, cron: null };
-    guildConfigs.set(name, config);
-    websiteConfig.set(guild.id, guildConfigs);
-    setupCron(guild.id, name, config);
-    return interaction.reply({ 
-      content: `웹사이트 크롤링이 추가되었습니다!\n이름: ${name}\nURL: ${url}\n알림 채널: ${channel.name}\n크롤링 간격: ${interval/60000}분`, 
-      flags: MessageFlags.Ephemeral
-    });
-  }
-  if (commandName === '웹사이트조회') {
-    if (!member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '관리자만 사용할 수 있습니다.', flags: MessageFlags.Ephemeral });
-    }
-    const guildConfigs = websiteConfig.get(guild.id);
-    if (!guildConfigs || guildConfigs.size === 0) return interaction.reply({ content: '설정된 웹사이트가 없습니다.', flags: MessageFlags.Ephemeral });
-    let msg = Array.from(guildConfigs.entries()).map(([name, cfg], i) => `#${i+1}\n이름: ${name}\nURL: ${cfg.url}\n알림 채널: <#${cfg.channelId}>\n크롤링 간격: ${cfg.interval/60000}분`).join('\n\n');
-    return interaction.reply({ content: `현재 설정:\n${msg}`, flags: MessageFlags.Ephemeral });
-  }
-  if (commandName === '웹사이트삭제') {
-    if (!member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '관리자만 사용할 수 있습니다.', flags: MessageFlags.Ephemeral });
-    }
-    const name = options.getString('name');
-    let guildConfigs = websiteConfig.get(guild.id);
-    if (!guildConfigs) return interaction.reply({ content: '설정된 웹사이트가 없습니다.', flags: MessageFlags.Ephemeral });
-    const config = guildConfigs.get(name);
-    if (!config) return interaction.reply({ content: '해당 이름이 등록되어 있지 않습니다.', flags: MessageFlags.Ephemeral });
-    if (config.cron) config.cron.stop();
-    guildConfigs.delete(name);
-    websiteConfig.set(guild.id, guildConfigs);
-    return interaction.reply({ content: '웹사이트 크롤링 설정이 삭제되었습니다.', flags: MessageFlags.Ephemeral });
-  }
-
-  // --- 음악 명령어 ---
-  if (commandName === 'play') {
-    const query = options.getString('query');
-    const source = options.getString('source') || 'youtube';
-    if (!member.voice.channel) return interaction.reply({ content: '음성 채널에 먼저 들어가세요!', flags: MessageFlags.Ephemeral });
-    if (source === 'youtube' || /youtu(be\.com|\.be)\//.test(query)) {
-      return interaction.reply({ content: '❌ 유튜브는 현재 재생할 수 없습니다. SoundCloud 또는 Spotify를 이용해 주세요.', flags: MessageFlags.Ephemeral });
-    }
-    try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      let playQuery = query;
-      if (source === 'spotify' && !/^https?:\/\//.test(query) && !query.startsWith('spotify:')) {
-        playQuery = `spotify:${query}`;
-      } else if (source === 'soundcloud' && !/^https?:\/\//.test(query) && !query.startsWith('scsearch:')) {
-        playQuery = `scsearch:"${query}"`;
-      }
-      playQueue.push({ interaction, query: playQuery, originalQuery: query, source });
-      await processQueue();
-      if (!/^https?:\/\//.test(query)) {
-        if (source === 'spotify') {
-          await interaction.editReply({
-            content: `🎶 Spotify에서 첫 번째 결과를 재생합니다.\n다른 곡을 원하면 Spotify에서 URL을 복사해 /play에 붙여넣으세요.`
-          });
-        } else if (source === 'soundcloud') {
-          await interaction.editReply({
-            content: `🎶 SoundCloud에서 첫 번째 결과를 재생합니다.\n다른 곡을 원하면 SoundCloud에서 URL을 복사해 /play에 붙여넣으세요.`
-          });
-        }
-      } else {
-        await interaction.editReply({ content: '🎶 재생을 시작합니다.' });
-      }
-    } catch (error) {
-      await interaction.editReply({ content: `❌ 오류: ${error.message}` });
-    }
-    return;
-  }
-  if (commandName === 'skip') {
-    const queue = distube.getQueue(guild.id);
-    if (!queue) return interaction.reply({ content: '재생 중인 곡이 없습니다.', flags: MessageFlags.Ephemeral });
-    queue.skip();
-    interaction.reply({ content: '⏭️ 다음 곡으로 스킵했습니다!', flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (commandName === 'queue') {
-    const queue = distube.getQueue(guild.id);
-    if (!queue || queue.songs.length === 0) return interaction.reply({ content: '재생 목록이 비어있습니다.', flags: MessageFlags.Ephemeral });
-    const embed = new EmbedBuilder()
-      .setTitle('재생 목록')
-      .setDescription(queue.songs.map((song, index) => `${index + 1}. [${song.name}](${song.url})`).join('\n'))
-      .setColor('Random');
-    interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (commandName === 'stop') {
-    const queue = distube.getQueue(guild.id);
-    if (!queue) return interaction.reply({ content: '재생 중인 곡이 없습니다.', flags: MessageFlags.Ephemeral });
-    queue.stop();
-    interaction.reply({ content: '⏹️ 재생을 중지했습니다.', flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  // --- 닉네임 색상 시스템 ---
-  if (commandName === '색상설정') {
-    const color = options.getString('hex코드').replace('#', '');
-    if (!/^[0-9A-Fa-f]{6}$/i.test(color)) return interaction.reply({ content: '❌ 올바른 HEX 코드를 입력해주세요!', ephemeral: true });
-    const roleName = `COLOR-${color}`;
-    let role = guild.roles.cache.find(r => r.name === roleName);
-    if (!role) {
-      role = await guild.roles.create({
-        name: roleName,
-        color: parseInt(color, 16),
-        permissions: []
-      });
-    }
-    await member.roles.add(role);
-    interaction.reply({ content: `✅ #${color} 색상이 적용되었습니다!`, ephemeral: true });
-  }
-
-  // --- 오늘의 운세 ---
-  if (commandName === '운세') {
-    const dateSeed = new Date().toISOString().split('T')[0] + interaction.user.id;
-    const hash = dateSeed.split('').reduce((a,c) => a + c.charCodeAt(0), 0);
-    interaction.reply(`🔮 오늘의 운세: ${fortunes[hash % 4]}`);
-  }
-
-  // --- 익명 메시지 ---
-  if (commandName === '익명') {
-    const msg = options.getString('메시지');
-    interaction.channel.send({
-      embeds: [new EmbedBuilder()
-        .setDescription(msg)
-        .setColor(0x2F3136)
-        .setFooter({ text: '익명 메시지' })
-      ]
-    });
-    interaction.reply({ content: '✅ 메시지 전송 완료', ephemeral: true });
-  }
-
-  // --- 공지채널설정 ---
-  if (commandName === '공지채널설정') {
-    const channel = options.getChannel('채널');
-    if (!channel || !channel.isTextBased()) {
-      return interaction.reply({ content: '텍스트 채널만 지정할 수 있습니다.', ephemeral: true });
-    }
-    await NoticeConfig.findOneAndUpdate(
-      { guildId: interaction.guild.id },
-      { noticeChannelId: channel.id },
-      { upsert: true }
-    );
-    interaction.reply({ content: `✅ 공지 채널이 <#${channel.id}>로 설정되었습니다!`, ephemeral: true });
-  }
-});
-
-// ===== 레벨/포인트 시스템 =====
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  const user = await User.findOneAndUpdate(
-    { userId: message.author.id },
-    { $inc: { xp: 5 + Math.floor(Math.random() * 10) } },
-    { upsert: true, new: true }
-  );
-  const newLevel = Math.floor(0.1 * Math.sqrt(user.xp));
-  if (newLevel > user.level) {
-    user.level = newLevel;
-    await user.save();
-    message.channel.send(`🎉 ${message.author} 레벨 업! (Lv. ${newLevel})`);
-  }
-});
-
 // ===== 음악 컨트롤 버튼 및 임베드 =====
 distube.on('playSong', async (queue, song) => {
   try {
@@ -450,56 +278,147 @@ client.on('interactionCreate', async interaction => {
 function setupCron(guildId, name, config) {
   if (config.cron) config.cron.stop();
   if (config.url && config.channelId) {
+    console.log(`[크롤러] setupCron: ${guildId}/${name} - ${config.url} → #${config.channelId} (${config.interval}ms)`);
     config.cron = cron.schedule(`*/${Math.max(1, Math.floor(config.interval / 60000))} * * * *`, () => checkWebsite(guildId, name));
+  } else {
+    console.log(`[크롤러] setupCron: ${guildId}/${name} - url/channelId 누락`);
   }
 }
 
-// ===== 웹크롤링 함수 =====
-function resolveUrl(link, baseUrl) {
-  try {
-    return new URL(link, baseUrl).href;
-  } catch {
-    return null;
-  }
-}
+// ===== Winston 로거 설정 =====
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'crawler.log' })
+  ]
+});
+
+// ===== axios 재시도 설정 =====
+axiosRetry(axios, { retries: 3, retryDelay: axiosRetry.exponentialDelay });
+
+// ===== 다양한 이미지 속성 지원 extractPost =====
 function extractPost($, el, baseUrl) {
   const $el = $(el);
-  const title = $el.find('[itemprop="name"], .title, h1, h2').first().text().trim();
-  const rawLink = $el.find('[href], [data-url]').attr('href') || $el.attr('data-url');
-  const link = resolveUrl(rawLink, baseUrl);
-  const image = $el.find('img').attr('src') || $el.find('[itemprop="image"]').attr('content');
+  const title = $el.find('.post-title, .entry-title, [itemprop="headline"], .title, h1, h2').first().text().trim();
+  // 링크: data-url, href, src 등
+  let rawLink = $el.find('[href], [data-url]').attr('href') || $el.attr('data-url') || $el.find('a').attr('href');
+  const link = rawLink ? urlJoin(baseUrl, rawLink) : null;
+  // 이미지: src, data-src, lazy-src, srcset, itemprop 등
+  let image = $el.find('img[data-src]').attr('data-src') ||
+              $el.find('img[lazy-src]').attr('lazy-src') ||
+              $el.find('img[srcset]').attr('srcset') ||
+              $el.find('img[src]').attr('src') ||
+              $el.find('[itemprop="image"]').attr('content');
+  // srcset에서 첫번째 이미지만 추출
+  if (image && image.includes(',')) image = image.split(',')[0].split(' ')[0];
   return { title, link, image };
 }
+
+// ===== 게시글 고유 해시 생성 (link 우선, 없으면 title+image) =====
+function getPostId(post) {
+  const base = post.link || (post.title + '|' + (post.image || ''));
+  return crypto.createHash('md5').update(base).digest('hex');
+}
+
+// ===== 사이트별 맞춤 셀렉터 우선, 없으면 fallback =====
+const POST_SELECTORS = [
+  '.post-item', '.article-list-item', 'article', 'li', 'section', 'div'
+];
+
+// ===== 동적 렌더링 + fallback 크롤링 =====
 async function checkWebsite(guildId, name) {
   const guildConfigs = websiteConfig.get(guildId);
-  if (!guildConfigs) return;
+  if (!guildConfigs) {
+    logger.warn(`[크롤러] guildId ${guildId}에 대한 설정 없음`);
+    return;
+  }
   const config = guildConfigs.get(name);
-  if (!config) return;
+  if (!config) {
+    logger.warn(`[크롤러] name ${name}에 대한 설정 없음`);
+    return;
+  }
+  let posts = [];
+  let usedDynamic = false;
   try {
-    const { data } = await axios.get(config.url);
-    const $ = cheerio.load(data);
-    const posts = [];
-    const postElements = $('div, article, section, li').toArray();
-    for (const el of postElements) {
-      try {
+    logger.info(`[크롤러] checkWebsite 시작: ${guildId}/${name}`);
+    // 1. Puppeteer로 동적 렌더링 시도
+    const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)');
+    await page.goto(config.url, { waitUntil: 'networkidle2', timeout: 20000 });
+    const content = await page.content();
+    const $ = cheerio.load(content);
+    for (const selector of POST_SELECTORS) {
+      $(selector).each((i, el) => {
         const post = extractPost($, el, config.url);
-        if (post.title && post.link) posts.push(post);
-      } catch (e) {}
+        if (post.title && (post.link || post.image)) posts.push(post);
+      });
+      if (posts.length > 0) break;
     }
-    if (posts.length > 0 && posts[0].title !== config.lastPostId) {
-      config.lastPostId = posts[0].title;
-      const channel = await client.channels.fetch(config.channelId).catch(() => null);
-      if (!channel?.isTextBased()) return;
-      const embed = new EmbedBuilder()
-        .setTitle(posts[0].title)
-        .setURL(posts[0].link)
-        .setImage(posts[0].image)
-        .addFields({ name: '바로가기', value: `[클릭](${posts[0].link})`, inline: true })
-        .setColor('#2b2d31');
-      await channel.send({ embeds: [embed] });
+    await browser.close();
+    usedDynamic = true;
+    logger.info(`[크롤러] Puppeteer posts 개수: ${posts.length}`);
+  } catch (err) {
+    logger.error(`[크롤러] Puppeteer 오류: ${err.message}`);
+  }
+  // 2. fallback: axios+cheerio (정적)
+  if (posts.length === 0) {
+    try {
+      const response = await axios.get(config.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
+        timeout: 10000
+      });
+      const $ = cheerio.load(response.data);
+      for (const selector of POST_SELECTORS) {
+        $(selector).each((i, el) => {
+          const post = extractPost($, el, config.url);
+          if (post.title && (post.link || post.image)) posts.push(post);
+        });
+        if (posts.length > 0) break;
+      }
+      logger.info(`[크롤러] cheerio fallback posts 개수: ${posts.length}`);
+    } catch (err) {
+      logger.error(`[크롤러] cheerio fallback 오류: ${err.message}`);
     }
-  } catch (error) {
-    console.error(`크롤링 오류:`, error);
+  }
+  // 3. 게시글 중복 감지 (link 해시)
+  if (posts.length > 0) {
+    const postId = getPostId(posts[0]);
+    logger.info(`[크롤러] 추출 postId: ${postId}, lastPostId: ${config.lastPostId}`);
+    if (postId !== config.lastPostId) {
+      config.lastPostId = postId;
+      await CrawlConfig.updateOne({ guildId, name }, { $set: { lastPostId: postId } });
+      // Discord 알림 전송
+      try {
+        const channel = await client.channels.fetch(config.channelId).catch(() => null);
+        if (!channel) {
+          logger.warn(`[크롤러] 채널 ${config.channelId}을 찾을 수 없음`);
+          return;
+        }
+        if (!channel.isTextBased()) {
+          logger.warn(`[크롤러] 채널 ${config.channelId}이 텍스트 채널이 아님`);
+          return;
+        }
+        const embed = new EmbedBuilder()
+          .setTitle(posts[0].title)
+          .setURL(posts[0].link || config.url)
+          .setImage(posts[0].image)
+          .addFields({ name: '바로가기', value: `[클릭](${posts[0].link || config.url})`, inline: true })
+          .setColor('#2b2d31');
+        await channel.send({ embeds: [embed] });
+        logger.info(`[크롤러] 새 글 알림 전송: ${posts[0].title}`);
+      } catch (err) {
+        logger.error(`[크롤러] Discord 알림 오류: ${err.message}`);
+      }
+    } else {
+      logger.info(`[크롤러] 새 글 없음 or 이미 알림 보냄: ${guildId}/${name}`);
+    }
+  } else {
+    logger.warn(`[크롤러] 게시글 추출 실패: ${guildId}/${name}`);
   }
 }
 
@@ -534,18 +453,78 @@ distube.on('error', async (channel, error) => {
   }
 });
 
-// ===== 대시보드 API (서버 랭킹) =====
-const dashboardApp = express();
-dashboardApp.get('/api/users', async (req, res) => {
-  const users = await User.find().sort({ level: -1, xp: -1 }).limit(10);
-  res.json(users);
-});
-dashboardApp.listen(3001);
+// ===== Express 서버 통합 =====
+const app = express();
+app.use(express.json());
 
-// ===== 웹훅 연동 시스템 (공지) =====
-const webhookApp = express();
-webhookApp.use(express.json());
-webhookApp.post('/webhook', async (req, res) => {
+// ===== API 라우터 =====
+const apiRouter = express.Router();
+apiRouter.get('/shop', async (req, res) => {
+  try {
+    const items = await ShopItem.find();
+    res.json(items);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+apiRouter.post('/purchase', async (req, res) => {
+  try {
+    const { userId, itemId } = req.body;
+    const item = await ShopItem.findOne({ itemId });
+    if (!item) return res.status(404).json({ error: '상품을 찾을 수 없습니다' });
+    const user = await User.findOne({ userId });
+    if (!user) return res.status(404).json({ error: '유저를 찾을 수 없습니다' });
+    if (user.points < item.price) return res.status(400).json({ error: '포인트가 부족합니다' });
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      await User.updateOne(
+        { userId },
+        { $inc: { points: -item.price }, $push: { purchasedItems: itemId } },
+        { session }
+      );
+      const purchase = new PurchaseHistory({ userId, itemId });
+      await purchase.save({ session });
+      await session.commitTransaction();
+      res.json({ success: true, message: '구매가 완료되었습니다' });
+    } catch (error) {
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      session.endSession();
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+apiRouter.get('/ranking', async (req, res) => {
+  try {
+    const users = await User.find()
+      .sort({ level: -1, xp: -1 })
+      .limit(10)
+      .select('userId level xp');
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.use('/api', apiRouter);
+
+// ===== 대시보드용 API 라우터 =====
+const dashboardRouter = express.Router();
+dashboardRouter.get('/users', async (req, res) => {
+  try {
+    const users = await User.find().sort({ level: -1, xp: -1 }).limit(10);
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+app.use('/dashboard', dashboardRouter);
+
+// ===== 웹훅 라우터 =====
+const webhookRouter = express.Router();
+webhookRouter.post('/', async (req, res) => {
   const guildId = req.body.guildId;
   const config = await NoticeConfig.findOne({ guildId });
   if (!config) return res.status(400).json({ error: '공지 채널이 설정되지 않았습니다.' });
@@ -561,6 +540,53 @@ webhookApp.post('/webhook', async (req, res) => {
   }
   res.sendStatus(200);
 });
+app.use('/webhook', webhookRouter);
+
+// ===== 자동 환급 스케줄러 =====
+cron.schedule('0 0 * * *', async () => {
+  try {
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const oldPurchases = await PurchaseHistory.find({ purchasedAt: { $lt: weekAgo } });
+    for (const purchase of oldPurchases) {
+      const item = await ShopItem.findOne({ itemId: purchase.itemId });
+      if (item) {
+        await User.updateOne(
+          { userId: purchase.userId },
+          { $inc: { points: item.price } }
+        );
+      }
+      await purchase.delete();
+    }
+  } catch (error) {
+    console.error('자동 환급 처리 중 오류:', error);
+  }
+});
+
+// ===== 서버 시작 시 크롤링 설정 복구 =====
+async function restoreCrawlers() {
+  try {
+    const configs = await CrawlConfig.find();
+    for (const conf of configs) {
+      if (!websiteConfig.has(conf.guildId)) websiteConfig.set(conf.guildId, new Map());
+      websiteConfig.get(conf.guildId).set(conf.name, {
+        url: conf.url,
+        channelId: conf.channelId,
+        interval: conf.interval,
+        lastPostId: conf.lastPostId
+      });
+      setupCron(conf.guildId, conf.name, websiteConfig.get(conf.guildId).get(conf.name));
+    }
+    console.log(`[크롤러] DB에서 ${configs.length}개 설정 복구 완료`);
+  } catch (err) {
+    console.error('[크롤러] 복구 중 오류:', err);
+  }
+}
+restoreCrawlers();
+
+// ===== 서버 실행 =====
+app.listen(3000, () => {
+  console.log('서버가 3000번 포트에서 실행 중입니다.');
+});
 
 // ===== 예외 핸들링 =====
 process.on('uncaughtException', error => {
@@ -571,3 +597,42 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
+// ===== 크롤링 대상 추가/삭제/상태 확인 함수 샘플 =====
+// 아래 함수들은 명령어/관리 API 등에서 활용할 수 있습니다.
+
+/**
+ * 크롤링 대상 추가
+ */
+async function addCrawlingTarget(guildId, name, url, channelId, interval = 60000) {
+  await CrawlConfig.create({ guildId, name, url, channelId, interval });
+  if (!websiteConfig.has(guildId)) websiteConfig.set(guildId, new Map());
+  websiteConfig.get(guildId).set(name, { url, channelId, interval, lastPostId: null });
+  setupCron(guildId, name, websiteConfig.get(guildId).get(name));
+  console.log(`[크롤러] 크롤링 대상 추가: ${guildId}/${name}`);
+}
+
+/**
+ * 크롤링 대상 삭제
+ */
+async function removeCrawlingTarget(guildId, name) {
+  await CrawlConfig.deleteOne({ guildId, name });
+  if (websiteConfig.has(guildId)) {
+    const conf = websiteConfig.get(guildId).get(name);
+    if (conf && conf.cron) conf.cron.stop();
+    websiteConfig.get(guildId).delete(name);
+    if (websiteConfig.get(guildId).size === 0) websiteConfig.delete(guildId);
+  }
+  console.log(`[크롤러] 크롤링 대상 삭제: ${guildId}/${name}`);
+}
+
+/**
+ * 현재 등록된 크롤링 대상/상태 출력
+ */
+function printCrawlingStatus() {
+  for (const [guildId, configs] of websiteConfig.entries()) {
+    for (const [name, conf] of configs.entries()) {
+      console.log(`[상태] ${guildId}/${name}: url=${conf.url}, channel=${conf.channelId}, interval=${conf.interval}, lastPostId=${conf.lastPostId}`);
+    }
+  }
+}
