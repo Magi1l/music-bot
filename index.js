@@ -59,7 +59,8 @@ const client = new Client({
 const adminCommands = require('./commands/admin/addShopItem');
 const userCommands = [
   require('./commands/user/ranking'),
-  require('./commands/user/previewProfile')
+  require('./commands/user/previewProfile'),
+  require('./commands/user/mabinogiNews')
 ];
 
 client.once('ready', async () => {
