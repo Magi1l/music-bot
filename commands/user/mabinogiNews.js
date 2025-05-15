@@ -43,6 +43,10 @@ module.exports = {
     .setName('마비노기새글')
     .setDescription('마비노기 모바일 공지/이벤트/업데이트/에린노트 전체 새 글을 카테고리별로 보여줍니다.'),
   async execute(interaction) {
+    if (!interaction.memberPermissions || !interaction.memberPermissions.has('Administrator')) {
+      await interaction.reply({ content: '이 명령어는 서버 관리자만 사용할 수 있습니다.', ephemeral: true });
+      return;
+    }
     await interaction.deferReply();
     const postsByCategory = await crawlAllCategories();
     let found = false;

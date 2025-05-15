@@ -1,7 +1,7 @@
 require('dotenv').config();
 const { 
   Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, 
-  PermissionsBitField, MessageFlags, ButtonStyle 
+  PermissionsBitField, MessageFlags, ButtonStyle, REST, Routes, SlashCommandBuilder 
 } = require('discord.js');
 const { DisTube } = require('distube');
 const { SpotifyPlugin } = require('@distube/spotify');
@@ -22,9 +22,13 @@ const axiosRetry = require('axios-retry');
 const urlJoin = require('url-join');
 const winston = require('winston');
 const crypto = require('crypto');
+const http = require('http');
+const { Server } = require('socket.io');
+const grantXP = require('./bot/grantXP');
+const { initWebSocketServer } = require('./lib/websocket-server');
 
 // ===== MongoDB 연결 및 모델 =====
-mongoose.connect(process.env.MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('✅ MongoDB 연결 성공'))
   .catch(err => console.error('❌ MongoDB 연결 실패:', err));
 
@@ -32,17 +36,28 @@ const userSchema = new mongoose.Schema({
   userId: String,
   xp: { type: Number, default: 0 },
   level: { type: Number, default: 1 },
-  points: { type: Number, default: 0 }
+  points: { type: Number, default: 0 },
+  username: String,
+  discriminator: String,
+  avatar: String
 });
 userSchema.index({ userId: 1 }, { unique: true });
 userSchema.index({ level: -1 });
 const User = mongoose.model('User', userSchema);
 
-const noticeConfigSchema = new mongoose.Schema({
-  guildId: String,
-  noticeChannelId: String
+const configSchema = new mongoose.Schema({
+  xpMultiplier: { type: Number, default: 1 },
+  // 필요한 설정 필드 추가 가능
 });
-const NoticeConfig = mongoose.model('NoticeConfig', noticeConfigSchema);
+const Config = mongoose.model('Config', configSchema);
+
+const profileSchema = new mongoose.Schema({
+  userId: String,
+  username: String,
+  cardUrl: String,
+  // 필요한 프로필 필드 추가 가능
+});
+const Profile = mongoose.model('Profile', profileSchema);
 
 // ===== Discord 클라이언트 =====
 const client = new Client({
@@ -56,15 +71,54 @@ const client = new Client({
 });
 
 // ===== 명령어 파일 불러오기 및 등록 =====
-const adminCommands = require('./commands/admin/addShopItem');
+const adminCommands = [
+  require('./commands/admin/addShopItem'),
+  require('./bot/addXpCommand'), // 관리자 명령어에 추가
+];
 const userCommands = [
   require('./commands/user/ranking'),
   require('./commands/user/previewProfile'),
-  require('./commands/user/mabinogiNews')
+  require('./commands/user/mabinogiNews'),
+  require('./commands/user/setColor'),
+  require('./bot/profileImageCommand'), // 유저 명령어에 추가
 ];
 
+// ===== 설정 캐시 및 주기적 동기화 =====
+let cachedConfig = null;
+const fetchConfig = async () => {
+  cachedConfig = await Config.findOne();
+  if (!cachedConfig) {
+    cachedConfig = await Config.create({}); // 기본값 생성
+  }
+};
+setInterval(fetchConfig, 5 * 60 * 1000); // 5분마다 동기화
+fetchConfig(); // 최초 1회
+
+// ===== 슬래시 명령어 등록 =====
+const commands = [
+  new SlashCommandBuilder()
+    .setName('프로필')
+    .setDescription('내 프로필 카드를 보여줍니다.'),
+].map(cmd => cmd.toJSON());
+
+const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
+(async () => {
+  try {
+    await rest.put(
+      Routes.applicationCommands(process.env.CLIENT_ID),
+      { body: commands },
+    );
+    console.log('슬래시 명령어 등록 완료');
+  } catch (error) {
+    console.error('슬래시 명령어 등록 실패:', error);
+  }
+})();
+
 client.once('ready', async () => {
-  await client.application.commands.set([adminCommands.data, ...userCommands.map(cmd => cmd.data)]);
+  await client.application.commands.set([
+    ...adminCommands.map(cmd => cmd.data),
+    ...userCommands.map(cmd => cmd.data)
+  ]);
   console.log('명령어 등록 완료!');
   console.log(`${client.user.tag} 온라인!`);
 });
@@ -74,31 +128,46 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const command = interaction.commandName;
   const userCommand = userCommands.find(cmd => cmd.data.name === command);
-  const adminCommand = adminCommands.data.name === command;
+  const adminCommand = adminCommands.find(cmd => cmd.data.name === command);
   if (adminCommand) {
-    await adminCommands.execute(interaction);
+    await adminCommand.execute(interaction);
   } else if (userCommand) {
     await userCommand.execute(interaction);
+  } else if (command === '프로필') {
+    let profileData = await Profile.findOne({ userId: interaction.user.id });
+    if (!profileData) {
+      // 없으면 새로 생성 (예시: 기본 이미지)
+      profileData = await Profile.create({
+        userId: interaction.user.id,
+        username: interaction.user.username,
+        cardUrl: 'https://via.placeholder.com/400x200?text=No+Profile',
+      });
+    }
+    const embed = new EmbedBuilder()
+      .setTitle(profileData.username)
+      .setImage(profileData.cardUrl)
+      .setDescription('프로필 카드입니다.');
+    await interaction.reply({ embeds: [embed] });
   }
 });
 
 // ===== 음성 경험치 적립 로직 =====
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  // 봇이거나 음성 채널 입장/퇴장 아닌 경우 무시
   if (!newState.member || newState.member.user.bot) return;
   const userId = newState.member.id;
   const guildId = newState.guild.id;
-  // 음성 채널에 새로 들어온 경우만 처리
+  // 입장 시 1회 지급 예시
   if (!oldState.channelId && newState.channelId) {
-    // 1분마다 경험치 지급 (간단 구현: 1분 후 1회 지급)
     setTimeout(async () => {
-      const config = await GuildConfig.findOne({ guildId });
-      const voiceXp = config?.xpConfig?.voiceXpPerMinute ?? 5;
-      await User.findOneAndUpdate(
-        { userId },
-        { $inc: { xp: voiceXp } },
-        { upsert: true, new: true }
-      );
+      const result = await grantXP({
+        discordId: userId,
+        guildId,
+        type: 'voice',
+        baseXP: 5,
+        channelId: newState.channelId,
+        requireMic: !newState.selfMute && !newState.selfDeaf
+      });
+      // 레벨업 등 후처리 필요시 여기에 추가
     }, 60 * 1000);
   }
 });
@@ -108,31 +177,23 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const guildId = message.guildId;
   const userId = message.author.id;
-  const config = await GuildConfig.findOne({ guildId });
-  const textXp = config?.xpConfig?.textXpPerMessage ?? 10;
-  const cooldown = config?.xpConfig?.textCooldown ?? 60;
-  const multipliers = config?.xpConfig?.textChannelMultipliers || [];
-  // 쿨타임 체크용 캐시 (메모리)
-  if (!global.textXpCooldown) global.textXpCooldown = {};
-  const key = `${guildId}:${userId}`;
-  const now = Date.now();
-  if (global.textXpCooldown[key] && now - global.textXpCooldown[key] < cooldown * 1000) return;
-  global.textXpCooldown[key] = now;
-  // 채널별 배수 적용
-  let multiplier = 1;
-  const found = multipliers.find(m => m.channelId === message.channel.id);
-  if (found) multiplier = found.multiplier;
-  const addXp = Math.round(textXp * multiplier);
-  const user = await User.findOneAndUpdate(
-    { userId },
-    { $inc: { xp: addXp } },
-    { upsert: true, new: true }
-  );
-  const newLevel = Math.floor(0.1 * Math.sqrt(user.xp));
-  if (newLevel > user.level) {
-    user.level = newLevel;
-    await user.save();
-    message.channel.send(`🎉 ${message.author} 레벨 업! (Lv. ${newLevel})`);
+  const result = await grantXP({
+    discordId: userId,
+    guildId,
+    type: 'message',
+    baseXP: 5,
+    channelId: message.channel.id
+  });
+  if (result.success) {
+    // 레벨업 처리
+    const user = result.user;
+    const newLevel = Math.floor(0.1 * Math.sqrt(user.xp));
+    if (newLevel > user.level) {
+      user.level = newLevel;
+      user.points = (user.points || 0) + 100;
+      await user.save();
+      message.channel.send(`🎉 ${message.author} 레벨 업! (Lv. ${newLevel})\n💰 100포인트가 지급되었습니다!`);
+    }
   }
 });
 
@@ -193,23 +254,6 @@ async function processQueue() {
 
 // ===== 웹사이트 크롤링 설정 구조 =====
 const websiteConfig = new Map(); // guildId → Map(name → config)
-
-// ===== 명령어 등록 (글로벌+길드 모두) =====
-client.once('ready', async () => {
-  // 글로벌 등록
-  await client.application.commands.set(commands);
-  console.log('글로벌 명령어 등록 완료!');
-
-  // 길드(서버) 전용 등록(즉시 반영)
-  const guild = client.guilds.cache.get('652710221759774730');
-  if (guild) {
-    await guild.commands.set(commands);
-    console.log('길드(652710221759774730) 전용 명령어 등록 완료!');
-  } else {
-    console.log('서버(652710221759774730)에 봇이 없습니다.');
-  }
-  console.log(`${client.user.tag} 온라인!`);
-});
 
 // ===== 음악 컨트롤 버튼 및 임베드 =====
 distube.on('playSong', async (queue, song) => {
@@ -509,6 +553,26 @@ apiRouter.get('/ranking', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+apiRouter.get('/ranking/all', async (req, res) => {
+  try {
+    // 모든 유저 랭킹 (레벨, xp 내림차순)
+    const users = await User.find().sort({ level: -1, xp: -1 });
+    // 색상 역할(닉네임 색상) 추출: roles 필드는 프론트에서 별도 API로 받아야 함 (여기선 userId만 반환)
+    res.json(users.map(u => ({
+      userId: u.userId,
+      level: u.level,
+      xp: u.xp,
+      points: u.points
+      // 색상 hex코드는 프론트에서 Discord API로 roles 중 #RRGGBB 이름을 찾아 표시
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+apiRouter.get('/bot/guilds', (req, res) => {
+  const guildIds = client.guilds.cache.map(guild => guild.id);
+  res.json(guildIds);
+});
 app.use('/api', apiRouter);
 
 // ===== 대시보드용 API 라우터 =====
@@ -522,26 +586,6 @@ dashboardRouter.get('/users', async (req, res) => {
   }
 });
 app.use('/dashboard', dashboardRouter);
-
-// ===== 웹훅 라우터 =====
-const webhookRouter = express.Router();
-webhookRouter.post('/', async (req, res) => {
-  const guildId = req.body.guildId;
-  const config = await NoticeConfig.findOne({ guildId });
-  if (!config) return res.status(400).json({ error: '공지 채널이 설정되지 않았습니다.' });
-  const channel = client.channels.cache.get(config.noticeChannelId);
-  if (channel) {
-    channel.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('새 공지')
-        .setDescription(req.body.content)
-        .setColor(0x00FF00)
-      ]
-    });
-  }
-  res.sendStatus(200);
-});
-app.use('/webhook', webhookRouter);
 
 // ===== 자동 환급 스케줄러 =====
 cron.schedule('0 0 * * *', async () => {
@@ -584,10 +628,8 @@ async function restoreCrawlers() {
 }
 restoreCrawlers();
 
-// ===== 서버 실행 =====
-app.listen(3000, () => {
-  console.log('서버가 3000번 포트에서 실행 중입니다.');
-});
+// ===== WebSocket 서버 통합 (5042 포트) =====
+initWebSocketServer(app, User, Profile);
 
 // ===== 예외 핸들링 =====
 process.on('uncaughtException', error => {
@@ -637,3 +679,40 @@ function printCrawlingStatus() {
     }
   }
 }
+
+// 리액션 XP 지급 (예시: messageReactionAdd)
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  const guildId = reaction.message.guildId;
+  const userId = user.id;
+  await grantXP({
+    discordId: userId,
+    guildId,
+    type: 'reaction',
+    baseXP: 2,
+    channelId: reaction.message.channel.id
+  });
+});
+
+// 커맨드 XP 지급 (슬래시 명령어 기준)
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  const guildId = interaction.guildId;
+  const userId = interaction.user.id;
+  await grantXP({
+    discordId: userId,
+    guildId,
+    type: 'command',
+    baseXP: 3,
+    channelId: interaction.channelId
+  });
+  // 기존 명령어 처리 분기(아래에 유지)
+  const command = interaction.commandName;
+  const userCommand = userCommands.find(cmd => cmd.data.name === command);
+  const adminCommand = adminCommands.find(cmd => cmd.data.name === command);
+  if (adminCommand) {
+    await adminCommand.execute(interaction);
+  } else if (userCommand) {
+    await userCommand.execute(interaction);
+  }
+});
