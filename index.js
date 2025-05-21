@@ -26,6 +26,11 @@ const http = require('http');
 const { Server } = require('socket.io');
 const grantXP = require('./bot/grantXP');
 const { initWebSocketServer } = require('./lib/websocket-server');
+const Guild = require('./models/Guild');
+const fs = require('fs');
+
+const DASHBOARD_API_URL = process.env.DASHBOARD_API_URL;
+const DASHBOARD_SHOP_URL = process.env.DASHBOARD_SHOP_URL;
 
 // ===== MongoDB 연결 및 모델 =====
 mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
@@ -96,58 +101,91 @@ fetchConfig(); // 최초 1회
 
 // ===== 슬래시 명령어 등록 =====
 const commands = [
-  new SlashCommandBuilder()
-    .setName('프로필')
-    .setDescription('내 프로필 카드를 보여줍니다.'),
+  new SlashCommandBuilder().setName('프로필').setDescription('내 대시보드 프로필 카드를 보여줍니다.'),
+  new SlashCommandBuilder().setName('랭킹').setDescription('현재 서버 랭킹을 보여줍니다.'),
+  new SlashCommandBuilder().setName('상점').setDescription('대시보드 상점 링크를 안내합니다.'),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
-(async () => {
-  try {
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands },
-    );
-    console.log('슬래시 명령어 등록 완료');
-  } catch (error) {
-    console.error('슬래시 명령어 등록 실패:', error);
-  }
-})();
 
+// 명령어 등록
+async function registerCommands() {
+  try {
+    const commands = [];
+    
+    // user 명령어 등록
+    const userCommands = fs.readdirSync('./commands/user')
+      .filter(file => file.endsWith('.js'))
+      .map(file => require(`./commands/user/${file}`));
+    
+    // admin 명령어 등록
+    const adminCommands = fs.readdirSync('./commands/admin')
+      .filter(file => file.endsWith('.js'))
+      .map(file => require(`./commands/admin/${file}`));
+    
+    commands.push(...userCommands, ...adminCommands);
+    
+    await rest.put(
+      Routes.applicationCommands(client.user.id),
+      { body: commands }
+    );
+    
+    console.log('명령어가 성공적으로 등록되었습니다.');
+  } catch (error) {
+    console.error('명령어 등록 중 오류 발생:', error);
+  }
+}
+
+// 봇이 준비되면 명령어 등록
 client.once('ready', async () => {
-  await client.application.commands.set([
-    ...adminCommands.map(cmd => cmd.data),
-    ...userCommands.map(cmd => cmd.data)
-  ]);
-  console.log('명령어 등록 완료!');
-  console.log(`${client.user.tag} 온라인!`);
+  console.log(`${client.user.tag} 봇이 준비되었습니다!`);
+  await registerCommands();
 });
 
 // ===== 명령어 처리 =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  const command = interaction.commandName;
-  const userCommand = userCommands.find(cmd => cmd.data.name === command);
-  const adminCommand = adminCommands.find(cmd => cmd.data.name === command);
-  if (adminCommand) {
-    await adminCommand.execute(interaction);
-  } else if (userCommand) {
-    await userCommand.execute(interaction);
-  } else if (command === '프로필') {
-    let profileData = await Profile.findOne({ userId: interaction.user.id });
-    if (!profileData) {
-      // 없으면 새로 생성 (예시: 기본 이미지)
-      profileData = await Profile.create({
-        userId: interaction.user.id,
-        username: interaction.user.username,
-        cardUrl: 'https://via.placeholder.com/400x200?text=No+Profile',
-      });
+  const { commandName } = interaction;
+
+  if (commandName === '프로필') {
+    try {
+      const res = await axios.get(`${DASHBOARD_API_URL}/api/profile/${interaction.user.id}`);
+      const profile = res.data;
+      const embed = new EmbedBuilder()
+        .setTitle(`${profile.username}님의 프로필 카드`)
+        .setImage(profile.cardUrl)
+        .setDescription(profile.description || '');
+      await interaction.reply({ embeds: [embed] });
+    } catch (err) {
+      await interaction.reply('프로필 정보를 불러오지 못했습니다.');
     }
-    const embed = new EmbedBuilder()
-      .setTitle(profileData.username)
-      .setImage(profileData.cardUrl)
-      .setDescription('프로필 카드입니다.');
-    await interaction.reply({ embeds: [embed] });
+  } else if (commandName === '랭킹') {
+    try {
+      const res = await axios.get(`${DASHBOARD_API_URL}/api/ranking`);
+      const users = res.data;
+      const embed = new EmbedBuilder()
+        .setTitle('서버 랭킹 TOP 10')
+        .setDescription(users.map((u, i) => `**${i+1}위** - ${u.username} (Lv.${u.level}, XP: ${u.xp})`).join('\n'));
+      await interaction.reply({ embeds: [embed] });
+    } catch (err) {
+      await interaction.reply('랭킹 정보를 불러오지 못했습니다.');
+    }
+  } else if (commandName === '상점') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel('대시보드 상점 바로가기')
+        .setStyle(ButtonStyle.Link)
+        .setURL(DASHBOARD_SHOP_URL)
+    );
+    await interaction.reply({ content: '대시보드 상점은 아래 버튼을 클릭하세요!', components: [row] });
+  } else {
+    const userCommand = userCommands.find(cmd => cmd.data.name === commandName);
+    const adminCommand = adminCommands.find(cmd => cmd.data.name === commandName);
+    if (adminCommand) {
+      await adminCommand.execute(interaction);
+    } else if (userCommand) {
+      await userCommand.execute(interaction);
+    }
   }
 });
 
@@ -196,61 +234,6 @@ client.on('messageCreate', async message => {
     }
   }
 });
-
-// ===== DisTube(음악) 설정 =====
-const cookies = process.env.YOUTUBE_COOKIE?.split(';')
-  .map(pair => {
-    if (!pair.includes('=')) return null;
-    const [name, value] = pair.trim().split('=').map(s => s.trim());
-    return { name, value, domain: '.youtube.com', path: '/' };
-  })
-  .filter(cookie => cookie.name && cookie.value) || [];
-
-const distube = new DisTube(client, {
-  plugins: [
-    new SpotifyPlugin({
-      api: {
-        clientId: process.env.SPOTIFY_CLIENT_ID,
-        clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
-      }
-    }),
-    new SoundCloudPlugin(),
-    // new YouTubePlugin({ cookies }),
-  ],
-  emitNewSongOnly: true,
-  nsfw: false,
-});
-
-// ===== 재생 큐 시스템 =====
-const playQueue = [];
-let isPlaying = false;
-async function processQueue() {
-  if (isPlaying || playQueue.length === 0) return;
-  isPlaying = true;
-  try {
-    const { interaction, query, originalQuery, source } = playQueue.shift();
-    await distube.play(interaction.member.voice.channel, query, {
-      member: interaction.member,
-      textChannel: interaction.channel,
-      metadata: { source: source || (query.startsWith('spotify:') ? 'spotify' : query.startsWith('scsearch:') ? 'soundcloud' : 'youtube') }
-    }).catch(error => {
-      console.error('DisTube 재생 오류:', error);
-      interaction.editReply({ content: `❌ 재생 오류: ${error.message}` }).catch(() => {});
-      throw error;
-    });
-    setTimeout(() => {
-      const queue = distube.getQueue(interaction.guildId);
-      if (!queue || !queue.songs || queue.songs.length === 0) {
-        interaction.editReply({ content: `❌ 재생 가능한 곡을 찾지 못했습니다.\n- 입력: ${originalQuery || query}\n- 플랫폼: ${source || 'youtube'}\n다른 검색어나 URL을 시도해보세요.` }).catch(() => {});
-      }
-    }, 2000);
-  } catch (error) {
-    console.error('큐 처리 오류:', error);
-    try { await interaction.editReply({ content: `❌ 오류: ${error.message}` }).catch(() => {}); } catch {}
-  }
-  isPlaying = false;
-  processQueue();
-}
 
 // ===== 웹사이트 크롤링 설정 구조 =====
 const websiteConfig = new Map(); // guildId → Map(name → config)
@@ -714,5 +697,138 @@ client.on('interactionCreate', async interaction => {
     await adminCommand.execute(interaction);
   } else if (userCommand) {
     await userCommand.execute(interaction);
+  }
+});
+
+// ===== 서버(길드) 정보 DB 저장 및 통계 =====
+client.on('guildCreate', async guild => {
+  await Guild.findOneAndUpdate(
+    { guildId: guild.id },
+    { name: guild.name, joinedAt: new Date(), memberCount: guild.memberCount },
+    { upsert: true }
+  );
+  console.log(`[서버 추가] ${guild.name} (${guild.id})`);
+});
+
+client.on('guildDelete', async guild => {
+  await Guild.deleteOne({ guildId: guild.id });
+  console.log(`[서버 제거] ${guild.name} (${guild.id})`);
+});
+
+client.on('guildMemberAdd', async member => {
+  await Guild.findOneAndUpdate(
+    { guildId: member.guild.id },
+    { $inc: { memberCount: 1 } }
+  );
+
+  try {
+    // User 모델에 새 유저 추가
+    await User.findOneAndUpdate(
+      { userId: member.id },
+      {
+        userId: member.id,
+        username: member.user.username,
+        discriminator: member.user.discriminator,
+        avatar: member.user.displayAvatarURL(),
+        xp: 0,
+        level: 1,
+        points: 0
+      },
+      { upsert: true }
+    );
+
+    // Profile 모델에 새 프로필 추가
+    await Profile.findOneAndUpdate(
+      { userId: member.id },
+      {
+        userId: member.id,
+        username: member.user.username,
+        cardUrl: member.user.displayAvatarURL()
+      },
+      { upsert: true }
+    );
+
+    console.log(`[프로필] 새 유저 프로필 생성: ${member.user.tag}`);
+  } catch (error) {
+    console.error('[프로필] 새 유저 프로필 생성 실패:', error);
+  }
+});
+
+client.on('guildMemberRemove', async member => {
+  await Guild.findOneAndUpdate(
+    { guildId: member.guild.id },
+    { $inc: { memberCount: -1 } }
+  );
+});
+
+// ===== 메시지 카운트 및 마지막 메시지 시각 =====
+const recentActivity = new Map(); // guildId -> Map(userId -> lastActiveDate)
+client.on('messageCreate', async message => {
+  if (!message.guild || message.author.bot) return;
+  await Guild.findOneAndUpdate(
+    { guildId: message.guild.id },
+    {
+      $inc: { messageCount: 1 },
+      $set: { lastMessageAt: new Date() }
+    }
+  );
+  // 최근 활동 멤버 기록
+  if (!recentActivity.has(message.guild.id)) recentActivity.set(message.guild.id, new Map());
+  recentActivity.get(message.guild.id).set(message.author.id, new Date());
+});
+
+// ===== 활성 멤버 집계 (매일 1회) =====
+cron.schedule('0 4 * * *', async () => {
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const guilds = await Guild.find();
+  for (const guild of guilds) {
+    let activeCount = 0;
+    const activity = recentActivity.get(guild.guildId);
+    if (activity) {
+      for (const lastActive of activity.values()) {
+        if (lastActive > sevenDaysAgo) activeCount++;
+      }
+    }
+    await Guild.updateOne({ guildId: guild.guildId }, { activeMemberCount: activeCount });
+  }
+  console.log('[통계] 활성 멤버 수 집계 완료');
+});
+
+// ===== 서버 리스트 API =====
+app.get('/api/guilds', async (req, res) => {
+  try {
+    const guilds = await Guild.find();
+    res.json(guilds);
+  } catch (err) {
+    res.status(500).json({ error: '서버 목록을 불러오지 못했습니다.' });
+  }
+});
+
+// 유저 정보 업데이트
+client.on('userUpdate', async (oldUser, newUser) => {
+  try {
+    // User 모델 업데이트
+    await User.updateOne(
+      { userId: newUser.id },
+      {
+        username: newUser.username,
+        discriminator: newUser.discriminator,
+        avatar: newUser.displayAvatarURL()
+      }
+    );
+
+    // Profile 모델 업데이트
+    await Profile.updateOne(
+      { userId: newUser.id },
+      {
+        username: newUser.username,
+        cardUrl: newUser.displayAvatarURL()
+      }
+    );
+
+    console.log(`[프로필] 유저 정보 업데이트: ${newUser.tag}`);
+  } catch (error) {
+    console.error('[프로필] 유저 정보 업데이트 실패:', error);
   }
 });
